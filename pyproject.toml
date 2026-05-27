@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cln"
+version = "0.1.0"
+description = "Redes Líquidas de Aprendizaje Continuo - Continuous Liquid Networks (Hybrid)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "CLN Research"},
+]
+keywords = ["deep-learning", "liquid-networks", "continuous-learning", "llm", "neural-networks"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+    "tqdm>=4.65.0",
+    "matplotlib>=3.7.0",
+    "transformers>=4.35.0",
+    "tiktoken>=0.5.0",
+    "flask>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
