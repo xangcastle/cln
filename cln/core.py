@@ -177,10 +177,18 @@ class LiquidLinear(nn.Module):
             post: Post-synaptic activations, shape [..., out_features].
         """
         with torch.no_grad():
-            pre_mean  = pre.reshape(-1, self.in_features).float().mean(0)
-            post_mean = post.reshape(-1, self.out_features).float().mean(0)
+            if pre.dim() == 2:
+                pre  = pre.unsqueeze(1)
+                post = post.unsqueeze(1)
+            B, S, _ = pre.shape
 
-            hebbian = torch.outer(post_mean, pre_mean)
+            pre_f  = pre.float()
+            post_f = post.float()
+
+            pre_c  = pre_f  - pre_f.mean(dim=1, keepdim=True)
+            post_c = post_f - post_f.mean(dim=1, keepdim=True)
+
+            hebbian = torch.einsum('bso,bsi->oi', post_c, pre_c) / (B * S)
             h_norm = hebbian.norm()
             if h_norm > 1e-6:
                 hebbian = hebbian / h_norm
