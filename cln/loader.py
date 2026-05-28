@@ -162,19 +162,16 @@ def save_plastic_state_hf(model: nn.Module, path: str) -> None:
     state: dict = {"__model_id__": getattr(model, "_cln_model_id", None)}
     for name, m in model.named_modules():
         if isinstance(m, LiquidLinear):
-            entry: dict = {}
+            entry: dict = {
+                "fisher":       m.fisher.cpu(),
+                "anchor_delta": m.anchor_delta.cpu(),
+            }
             if m.lora_rank > 0:
                 entry["lora_A"] = m.lora_A.cpu()
                 entry["lora_B"] = m.lora_B.cpu()
                 entry["lora_rank"] = m.lora_rank
-                entry["fisher_A"] = m.fisher_A.cpu()
-                entry["fisher_B"] = m.fisher_B.cpu()
-                entry["anchor_A"] = m.anchor_A.cpu()
-                entry["anchor_B"] = m.anchor_B.cpu()
             else:
                 entry["delta_w"] = m.delta_w.cpu()
-                entry["fisher"] = m.fisher.cpu()
-                entry["anchor_delta"] = m.anchor_delta.cpu()
             state[name] = entry
     torch.save(state, path)
 
@@ -230,20 +227,14 @@ def load_plastic_state_hf(model: nn.Module, path: str) -> bool:
                 continue
             m.lora_A.copy_(ls["lora_A"].to(m.lora_A.device, m.lora_A.dtype))
             m.lora_B.copy_(ls["lora_B"].to(m.lora_B.device, m.lora_B.dtype))
-            if "fisher_A" in ls:
-                m.fisher_A.copy_(ls["fisher_A"].float().cpu())
-                m.fisher_B.copy_(ls["fisher_B"].float().cpu())
-                m.anchor_A.copy_(ls["anchor_A"].float().cpu())
-                m.anchor_B.copy_(ls["anchor_B"].float().cpu())
-        elif "delta_w" in ls and m.lora_rank == 0:
+        elif "delta_w" in ls:
             dw_saved = ls["delta_w"]
             if dw_saved.shape != m.delta_w.shape:
                 skipped += 1
                 continue
             m.delta_w.copy_(dw_saved.to(m.delta_w.device, m.delta_w.dtype))
-            if "fisher" in ls:
-                m.fisher.copy_(ls["fisher"].float().cpu())
-                m.anchor_delta.copy_(ls["anchor_delta"].float().cpu())
+        m.fisher.copy_(ls["fisher"].float().cpu())
+        m.anchor_delta.copy_(ls["anchor_delta"].float().cpu())
 
     if skipped:
         print(f"  [CLN] {skipped} layers skipped (shape mismatch).")

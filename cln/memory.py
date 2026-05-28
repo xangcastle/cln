@@ -84,20 +84,11 @@ class TopologicalMemory:
             "interaction_log": self.interaction_log[-1000:],
         }
         for name, layer in self._liquid_layers().items():
-            entry = {}
-            if layer.lora_rank > 0:
-                entry["lora_A"] = layer.lora_A.cpu()
-                entry["lora_B"] = layer.lora_B.cpu()
-                entry["lora_rank"] = layer.lora_rank
-                entry["fisher_A"] = layer.fisher_A.cpu()
-                entry["fisher_B"] = layer.fisher_B.cpu()
-                entry["anchor_A"] = layer.anchor_A.cpu()
-                entry["anchor_B"] = layer.anchor_B.cpu()
-            else:
-                entry["delta_w"] = layer.delta_w.cpu()
-                entry["fisher"] = layer.fisher.cpu()
-                entry["anchor_delta"] = layer.anchor_delta.cpu()
-            state[name] = entry
+            state[name] = {
+                "delta_w":      layer.delta_w.cpu(),
+                "fisher":       layer.fisher.cpu(),
+                "anchor_delta": layer.anchor_delta.cpu(),
+            }
         torch.save(state, path)
 
     def load(self, path: str) -> bool:
@@ -126,19 +117,13 @@ class TopologicalMemory:
                 continue
             m = layers[name]
             device = m.plastic_device
-            if "lora_A" in ls and m.lora_rank > 0:
+            if "delta_w" in ls and not m.lora_rank:
+                m.delta_w.copy_(ls["delta_w"].to(device))
+            elif "lora_A" in ls and m.lora_rank:
                 m.lora_A.copy_(ls["lora_A"].to(device, m.lora_A.dtype))
                 m.lora_B.copy_(ls["lora_B"].to(device, m.lora_B.dtype))
-                if "fisher_A" in ls:
-                    m.fisher_A.copy_(ls["fisher_A"].to(device, m.fisher_A.dtype))
-                    m.fisher_B.copy_(ls["fisher_B"].to(device, m.fisher_B.dtype))
-                    m.anchor_A.copy_(ls["anchor_A"].to(device, m.anchor_A.dtype))
-                    m.anchor_B.copy_(ls["anchor_B"].to(device, m.anchor_B.dtype))
-            elif "delta_w" in ls and m.lora_rank == 0:
-                m.delta_w.copy_(ls["delta_w"].to(device, m.delta_w.dtype))
-                if "fisher" in ls:
-                    m.fisher.copy_(ls["fisher"].to(device, m.fisher.dtype))
-                    m.anchor_delta.copy_(ls["anchor_delta"].to(device, m.anchor_delta.dtype))
+            m.fisher.copy_(ls["fisher"].to(device))
+            m.anchor_delta.copy_(ls["anchor_delta"].to(device))
 
         self.step_count = state.get("step_count", 0)
         self.interaction_log = state.get("interaction_log", [])
@@ -186,7 +171,7 @@ class TopologicalMemory:
         for name, layer in self._liquid_layers().items():
             base_norm   = layer.weight.data.norm().item()
             delta_norm  = layer.plastic_norm()
-            fisher_norm = layer.fisher_norm()
+            fisher_norm = layer.fisher.norm().item()
             result[name] = {
                 "delta_norm":       round(delta_norm, 6),
                 "fisher_norm":      round(fisher_norm, 6),

@@ -156,7 +156,7 @@ class ConversationTracker:
             dn = m.plastic_norm()
             bn = m.weight.data.norm().item()
             snap["norms"][name]        = dn
-            snap["fisher_norms"][name] = m.fisher_norm()
+            snap["fisher_norms"][name] = m.fisher.norm().item()
             snap["ratios"][name]       = dn / (bn + 1e-8)
             if name in heatmap_candidates:
                 snap["heatmaps"][name] = self._downsample(m.plastic_delta)
@@ -287,7 +287,7 @@ class ConversationTracker:
                 if isinstance(m, LiquidLinear)
             }.get(snap_layer)
             if layer_obj is not None:
-                fisher_arr = self._downsample(layer_obj.plastic_fisher)
+                fisher_arr = self._downsample(layer_obj.fisher)
                 im2 = ax_fisher.imshow(
                     fisher_arr, aspect="auto", cmap="YlOrRd",
                     vmin=0.0, interpolation="nearest",

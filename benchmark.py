@@ -68,7 +68,7 @@ def encode(text: str) -> torch.Tensor:
     return torch.tensor([ids], dtype=torch.long)
 
 
-def make_model(device: torch.device, lora_rank: int = 0) -> CLNModel:
+def make_model(device: torch.device) -> CLNModel:
     """Small but non-trivial CLNModel for fast benchmark iteration."""
     return CLNModel(
         vocab_size=256,
@@ -81,7 +81,6 @@ def make_model(device: torch.device, lora_rank: int = 0) -> CLNModel:
         liquid_kwargs={
             "tau_w": 20.0, "eta": 5e-4,
             "lambda_ewc": 0.05, "dt": 0.1, "max_delta": 0.3,
-            "lora_rank": lora_rank,
         },
     ).eval().to(device)
 
@@ -699,10 +698,10 @@ def main():
             results["ewc"] = bench_ewc_hf(model, tokenizer, device, n_passes=args.passes)
 
     else:
-        model = make_model(device, lora_rank=args.lora_rank)
+        model = make_model(device)
         counts = model.param_count()
         print(f"  Device  : {device}")
-        print(f"  Model   : CLNModel  d=256  L=6  H=4 (LoRA={args.lora_rank})")
+        print(f"  Model   : CLNModel  d=256  L=6  H=4")
         print(f"            {counts['static']:,} static params | {counts['plastic']:,} plastic params")
         print(f"  Tokens  : {args.tokens}  (speed test)")
         print(f"  Passes  : {args.passes}  (learning tests)")
