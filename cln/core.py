@@ -17,6 +17,13 @@ Where:
 Effective weight: W_eff = W_base + ΔW
     W_base is trained via gradient descent and then frozen.
     ΔW is updated online — no gradients needed.
+
+Improvements over the naive Hebbian rule:
+  - Covariance: activations are centered over the sequence before correlation.
+  - Exact per-token: torch.einsum over [B, S, D] instead of collapsing to mean first.
+  - Liquid LoRA: optional low-rank factorization ΔW ≈ A·B (lora_rank > 0).
+  - Episodic: accumulate Hebbian statistics for N steps before applying the ODE (accumulate_steps > 1).
+  - Learnable τ and η stored as nn.Parameter, kept positive via softplus.
 """
 
 import math
@@ -31,12 +38,7 @@ _PLASTIC_ENABLED: bool = True
 
 
 def set_plastic_mode(enabled: bool) -> None:
-    """Enable or disable online Hebbian learning globally.
-
-    Args:
-        enabled: When False, all LiquidLinear layers skip their plastic
-            update step regardless of the per-call ``plastic`` argument.
-    """
+    """Enable or disable online Hebbian learning globally."""
     global _PLASTIC_ENABLED
     _PLASTIC_ENABLED = enabled
 
@@ -48,11 +50,7 @@ def get_plastic_mode() -> bool:
 
 @contextmanager
 def plastic_off():
-    """Context manager that temporarily disables plasticity for all layers.
-
-    Restores the previous flag on exit, even if an exception is raised.
-    Useful for evaluation passes where weight updates are unwanted.
-    """
+    """Context manager that temporarily disables plasticity for all layers."""
     global _PLASTIC_ENABLED
     prev = _PLASTIC_ENABLED
     _PLASTIC_ENABLED = False
@@ -63,34 +61,6 @@ def plastic_off():
 
 
 class LiquidLinear(nn.Module):
-    """Linear layer with plastic weights that evolve during inference.
-
-    Maintains two weight components:
-
-    - ``weight``: static base weights, trained offline via SGD/Adam and frozen.
-    - ``delta_w``: plastic delta, evolved online via a Hebbian ODE Euler step.
-
-    The effective computation is ``y = x @ (weight + delta_w).T + bias``.
-
-    After each forward pass (when plasticity is active), ``delta_w`` is updated
-    via one Euler step of the plasticity ODE entirely inside ``torch.no_grad()``,
-    so no gradient tape is required.
-
-    EWC (Elastic Weight Consolidation) prevents catastrophic forgetting: the
-    Fisher information matrix Ω tracks weight importance, and the consolidation
-    term pulls ``delta_w`` toward the last anchor weighted by that importance.
-    Fisher and anchor tensors are always stored on CPU to save device memory.
-
-    Attributes:
-        weight: Static base weight parameter, shape [out_features, in_features].
-        bias: Optional bias parameter, shape [out_features].
-        delta_w: Plastic weight delta buffer, same shape as weight.
-        fisher: Fisher information matrix buffer, kept on CPU.
-        anchor_delta: Last consolidated delta snapshot, kept on CPU.
-        plasticity_gate: Scalar buffer that scales the Hebbian update.
-            Can be modulated externally to suppress or amplify learning.
-    """
-
     def __init__(
         self,
         in_features: int,
@@ -102,35 +72,20 @@ class LiquidLinear(nn.Module):
         dt: float = 0.1,
         max_delta: float = 0.3,
         solver_mode: str = "ml_fast",
+        lora_rank: int = 0,
+        accumulate_steps: int = 1,
     ):
-        """Initialize a LiquidLinear layer.
-
-        Args:
-            in_features: Size of each input sample.
-            out_features: Size of each output sample.
-            bias: When True, a learnable bias is added to the output.
-            tau_w: Weight time constant. Larger values slow the exponential
-                decay of ``delta_w``, giving longer plastic memory.
-            eta: Hebbian plasticity learning rate. Controls how strongly
-                each forward pass modifies ``delta_w``.
-            lambda_ewc: EWC consolidation strength. Zero disables the EWC
-                term entirely.
-            dt: Euler step size for the ODE integration.
-            max_delta: Hard clamp applied to ``delta_w`` after each update
-                to prevent runaway weight growth.
-            solver_mode: ``"ml_fast"`` uses the standard Hebbian ODE path.
-                ``"bio_ode"`` routes computation through a biologically
-                inspired LiquidNeuronBank backend.
-        """
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.tau_w = tau_w
-        self.eta = eta
+        self.eta   = nn.Parameter(torch.tensor(eta,   dtype=torch.float32))
+        self.tau_w = nn.Parameter(torch.tensor(tau_w, dtype=torch.float32))
         self.lambda_ewc = lambda_ewc
         self.dt = dt
         self.max_delta = max_delta
         self.solver_mode = solver_mode
+        self.lora_rank = lora_rank
+        self.accumulate_steps = accumulate_steps
 
         if self.solver_mode == "bio_ode":
             from .bio_core import LiquidNeuronBank
@@ -154,70 +109,170 @@ class LiquidLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self.register_buffer("delta_w",       torch.zeros(out_features, in_features))
         self.register_buffer("fisher",        torch.zeros(out_features, in_features))
         self.register_buffer("anchor_delta",  torch.zeros(out_features, in_features))
         self.register_buffer("plasticity_gate", torch.ones(1))
 
+        if lora_rank > 0:
+            self.register_buffer("lora_A", torch.zeros(out_features, lora_rank))
+            self.register_buffer("lora_B", torch.zeros(lora_rank, in_features))
+            nn.init.kaiming_uniform_(self.lora_A)
+            
+            # We don't need full delta_w in memory during inference if we use LoRA
+            # but we keep it for backward compatibility with older saving scripts if needed.
+            # To save VRAM, we can just use lora_A @ lora_B on the fly.
+        else:
+            self.register_buffer("delta_w", torch.zeros(out_features, in_features))
+
+        if accumulate_steps > 1:
+            if lora_rank > 0:
+                self.register_buffer("_acc_dA", torch.zeros(out_features, lora_rank))
+                self.register_buffer("_acc_dB", torch.zeros(lora_rank, in_features))
+            else:
+                self.register_buffer("_hebbian_acc", torch.zeros(out_features, in_features))
+            self._acc_count: int = 0
+
     @property
     def effective_weight(self) -> torch.Tensor:
-        """Return the sum of base weights and the current plastic delta."""
+        """Return the effective weight combining base weights and plastic delta."""
+        if self.lora_rank > 0:
+            return self.weight + (self.lora_A.float() @ self.lora_B.float()).to(self.weight.dtype)
         return self.weight + self.delta_w
 
+    @property
+    def plastic_delta(self) -> torch.Tensor:
+        """Effective plastic delta as a dense tensor (works in both full and LoRA mode)."""
+        if self.lora_rank > 0:
+            return (self.lora_A.float() @ self.lora_B.float())
+        return self.delta_w.float()
+
+    @property
+    def plastic_device(self) -> torch.device:
+        """Device holding the plastic state."""
+        if self.lora_rank > 0:
+            return self.lora_A.device
+        return self.delta_w.device
+
+    def plastic_norm(self) -> float:
+        """L2 norm of the plastic delta (works in both full and LoRA mode)."""
+        return self.plastic_delta.norm().item()
+
+    def plastic_numel(self) -> int:
+        """Number of learnable plastic parameters (lora_A+lora_B or delta_w)."""
+        if self.lora_rank > 0:
+            return self.lora_A.numel() + self.lora_B.numel()
+        return self.delta_w.numel()
+
     def liquid_step(self, pre: torch.Tensor, post: torch.Tensor) -> None:
-        """Apply one Euler step of the plastic weight ODE.
-
-        Computes the Hebbian correlation between pre- and post-synaptic
-        activations, normalizes it (Oja-style) to prevent weight explosion,
-        optionally applies the EWC regularization term, and integrates with
-        step size ``dt``. The result is clamped to ``[-max_delta, max_delta]``.
-
-        Args:
-            pre: Pre-synaptic activations, shape [..., in_features].
-            post: Post-synaptic activations, shape [..., out_features].
-        """
         with torch.no_grad():
-            pre_mean  = pre.reshape(-1, self.in_features).float().mean(0)
-            post_mean = post.reshape(-1, self.out_features).float().mean(0)
+            if pre.dim() == 2:
+                pre  = pre.unsqueeze(1)
+                post = post.unsqueeze(1)
+            B, S, _ = pre.shape
 
-            hebbian = torch.outer(post_mean, pre_mean)
-            h_norm = hebbian.norm()
-            if h_norm > 1e-6:
-                hebbian = hebbian / h_norm
+            pre_f  = pre.float()
+            post_f = post.float()
 
-            ewc_dev = self.delta_w.device
-            if self.lambda_ewc > 0 and self.fisher.device == ewc_dev:
-                ewc = self.fisher.float() * (
-                    self.delta_w.float() - self.anchor_delta.float()
-                )
+            pre_c  = pre_f  - pre_f.mean(dim=1, keepdim=True)
+            post_c = post_f - post_f.mean(dim=1, keepdim=True)
+
+            tau  = float(F.softplus(self.tau_w))
+            eta  = float(F.softplus(self.eta))
+            gate = float(self.plasticity_gate)
+            
+            # The effective integration step if accumulated
+            eff_dt = self.dt * self.accumulate_steps
+
+            if self.lora_rank > 0:
+                A = self.lora_A.float()
+                B_mat = self.lora_B.float()
+                
+                # Math optimization: avoid computing the [Out, In] hebbian matrix.
+                # Hebbian term on B: dA_hebbian = (post_c.transpose(1, 2) @ (pre_c @ B.T))
+                # Hebbian term on A: dB_hebbian = ((post_c @ A).transpose(1, 2) @ pre_c)
+                
+                pre_c_flat = pre_c.view(-1, self.in_features)
+                post_c_flat = post_c.view(-1, self.out_features)
+                
+                # We do this as a batch matrix mult across the flattened B*S dimension
+                # post_c_flat.T is [Out, B*S]. pre_c_flat is [B*S, In]
+                # dA_hebbian = post_c_flat.T @ (pre_c_flat @ B_mat.T)  --> [Out, Rank]
+                # dB_hebbian = (post_c_flat @ A).T @ pre_c_flat        --> [Rank, In]
+                
+                dA_hebbian = torch.matmul(post_c_flat.t(), torch.matmul(pre_c_flat, B_mat.t())) / (B * S)
+                dB_hebbian = torch.matmul(torch.matmul(post_c_flat, A).t(), pre_c_flat) / (B * S)
+                
+                # Decay terms: A @ (B @ B.T) / tau
+                B_Bt = torch.matmul(B_mat, B_mat.t())
+                At_A = torch.matmul(A.t(), A)
+                
+                dA_decay = torch.matmul(A, B_Bt) / tau
+                dB_decay = torch.matmul(At_A, B_mat) / tau
+                
+                dA_ewc = 0
+                dB_ewc = 0
+                if self.lambda_ewc > 0 and hasattr(self, 'fisher'):
+                    if self.fisher.device == self.lora_A.device:
+                        # EWC for LoRA is computationally heavy because it requires Fisher(O, I)
+                        # We approximate or compute it exactly via broadcasting if memory permits.
+                        # For now, we compute exact EWC penalty on A and B, which requires 
+                        # forming the Delta W locally or running it on CPU.
+                        # To keep it extremely fast and VRAM efficient, we omit EWC from LoRA by default
+                        # unless explicitly computed on CPU offline during `consolidate`.
+                        pass
+                
+                dA = eff_dt * (eta * gate * dA_hebbian - dA_decay - dA_ewc)
+                dB = eff_dt * (eta * gate * dB_hebbian - dB_decay - dB_ewc)
+                
+                if self.accumulate_steps > 1:
+                    self._acc_dA.add_(dA)
+                    self._acc_dB.add_(dB)
+                    self._acc_count += 1
+                    if self._acc_count < self.accumulate_steps:
+                        return
+                    
+                    self.lora_A.add_(self._acc_dA.to(self.lora_A.dtype)).clamp_(-self.max_delta, self.max_delta)
+                    self.lora_B.add_(self._acc_dB.to(self.lora_B.dtype)).clamp_(-self.max_delta, self.max_delta)
+                    self._acc_dA.zero_()
+                    self._acc_dB.zero_()
+                    self._acc_count = 0
+                else:
+                    self.lora_A.add_(dA.to(self.lora_A.dtype)).clamp_(-self.max_delta, self.max_delta)
+                    self.lora_B.add_(dB.to(self.lora_B.dtype)).clamp_(-self.max_delta, self.max_delta)
+
             else:
-                ewc = torch.zeros_like(hebbian)
+                hebbian = torch.einsum('bso,bsi->oi', post_c, pre_c) / (B * S)
+                h_norm = hebbian.norm()
+                if h_norm > 1e-6:
+                    hebbian = hebbian / h_norm
+                
+                if self.accumulate_steps > 1:
+                    self._hebbian_acc.add_(hebbian)
+                    self._acc_count += 1
+                    if self._acc_count < self.accumulate_steps:
+                        return
+                    hebbian = self._hebbian_acc / self._acc_count
+                    self._hebbian_acc.zero_()
+                    self._acc_count = 0
 
-            dw = self.delta_w.float()
-            d_delta = (
-                -dw / self.tau_w
-                + self.eta * float(self.plasticity_gate) * hebbian
-                - self.lambda_ewc * ewc
-            )
+                ewc_dev = self.delta_w.device
+                if self.lambda_ewc > 0 and self.fisher.device == ewc_dev:
+                    ewc = self.fisher.float() * (self.delta_w.float() - self.anchor_delta.float())
+                else:
+                    ewc = torch.zeros_like(hebbian)
 
-            self.delta_w.add_((self.dt * d_delta).to(self.delta_w.dtype))
-            self.delta_w.clamp_(-self.max_delta, self.max_delta)
+                dw = self.delta_w.float()
+                d_delta = -dw / tau + eta * gate * hebbian - self.lambda_ewc * ewc
+                self.delta_w.add_((eff_dt * d_delta).to(self.delta_w.dtype))
+                self.delta_w.clamp_(-self.max_delta, self.max_delta)
 
     def consolidate(self, importance: Optional[torch.Tensor] = None) -> None:
-        """Merge the current plastic state into the EWC anchor.
-
-        Updates the Fisher information matrix with an exponential moving
-        average and records the current ``delta_w`` as the new anchor.
-        Both tensors are kept on CPU regardless of the device holding
-        ``delta_w``, to avoid VRAM pressure on CUDA/MPS models.
-
-        Args:
-            importance: Optional per-weight importance scores with the same
-                shape as ``delta_w``. When omitted, the absolute value of
-                ``delta_w`` is used as a proxy for importance.
-        """
         with torch.no_grad():
-            delta_cpu = self.delta_w.float().cpu()
+            if self.lora_rank > 0:
+                delta_cpu = (self.lora_A.float().cpu() @ self.lora_B.float().cpu())
+            else:
+                delta_cpu = self.delta_w.float().cpu()
+                
             imp = (
                 importance.float().cpu()
                 if importance is not None
@@ -227,29 +282,24 @@ class LiquidLinear(nn.Module):
             self.anchor_delta = delta_cpu.clone()
 
     def reset_plasticity(self) -> None:
-        """Zero out all plastic state, effectively wiping the layer's memory."""
-        self.delta_w.zero_()
         self.fisher.zero_()
         self.anchor_delta.zero_()
+        if self.lora_rank > 0:
+            self.lora_A.zero_()
+            nn.init.kaiming_uniform_(self.lora_A)
+            self.lora_B.zero_()
+        else:
+            self.delta_w.zero_()
+            
+        if self.accumulate_steps > 1:
+            if self.lora_rank > 0:
+                self._acc_dA.zero_()
+                self._acc_dB.zero_()
+            else:
+                self._hebbian_acc.zero_()
+            self._acc_count = 0
 
     def forward(self, x: torch.Tensor, plastic: Optional[bool] = None) -> torch.Tensor:
-        """Compute the linear transformation and optionally update plastic weights.
-
-        When plasticity is active, applies a Hebbian update via ``liquid_step``
-        after computing the output. The update runs outside the autograd graph.
-
-        For the ``"bio_ode"`` solver, the first call synchronizes base weights
-        into the biological backend before delegating the computation.
-
-        Args:
-            x: Input tensor of shape [..., in_features].
-            plastic: Overrides the global ``_PLASTIC_ENABLED`` flag for this
-                call. Pass ``True`` to force an update or ``False`` to skip it
-                regardless of the global setting. ``None`` defers to the global flag.
-
-        Returns:
-            Output tensor of shape [..., out_features].
-        """
         should_learn = _PLASTIC_ENABLED if plastic is None else plastic
 
         if self.solver_mode == "bio_ode":
@@ -267,7 +317,12 @@ class LiquidLinear(nn.Module):
             )
             return out
 
-        out = F.linear(x, self.effective_weight, self.bias)
+        if self.lora_rank > 0:
+            out = F.linear(x, self.weight, self.bias)
+            out_lora = F.linear(F.linear(x, self.lora_B.to(x.dtype)), self.lora_A.to(x.dtype))
+            out = out + out_lora
+        else:
+            out = F.linear(x, self.effective_weight, self.bias)
 
         if should_learn:
             self.liquid_step(x.detach(), torch.tanh(out.detach()))
@@ -276,45 +331,11 @@ class LiquidLinear(nn.Module):
 
 
 class LiquidTimeConstant(nn.Module):
-    """Per-neuron adaptive time constant implementing the core LTC property.
-
-    Computes a time constant τ(x) that varies with the input:
-
-        τ(x) = τ_min + σ(W_τ · x) · (τ_max − τ_min)
-
-    A small τ yields fast integration (high sensitivity to the current input).
-    A large τ yields slow integration (smoothed state that persists over time).
-
-    The network learns to be fast where precise reactions matter and slow
-    where it should integrate information across longer contexts.
-
-    Attributes:
-        tau_min: Minimum time constant value.
-        tau_range: Difference between maximum and minimum time constants.
-        w_tau: Learned linear projection that gates the time constant.
-    """
-
     def __init__(self, d_model: int, tau_min: float = 0.5, tau_max: float = 8.0):
-        """Initialize the adaptive time constant module.
-
-        Args:
-            d_model: Input and output feature dimension.
-            tau_min: Minimum time constant (fast neuron limit).
-            tau_max: Maximum time constant (slow neuron limit).
-        """
         super().__init__()
         self.tau_min = tau_min
         self.tau_range = tau_max - tau_min
         self.w_tau = nn.Linear(d_model, d_model, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute per-neuron time constants from the input.
-
-        Args:
-            x: Input tensor of shape [..., d_model].
-
-        Returns:
-            Time constant tensor of shape [..., d_model], with values in
-            [tau_min, tau_max].
-        """
         return self.tau_min + torch.sigmoid(self.w_tau(x)) * self.tau_range

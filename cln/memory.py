@@ -116,8 +116,12 @@ class TopologicalMemory:
             if name not in layers or not isinstance(ls, dict):
                 continue
             m = layers[name]
-            device = m.delta_w.device
-            m.delta_w.copy_(ls["delta_w"].to(device))
+            device = m.plastic_device
+            if "delta_w" in ls and not m.lora_rank:
+                m.delta_w.copy_(ls["delta_w"].to(device))
+            elif "lora_A" in ls and m.lora_rank:
+                m.lora_A.copy_(ls["lora_A"].to(device, m.lora_A.dtype))
+                m.lora_B.copy_(ls["lora_B"].to(device, m.lora_B.dtype))
             m.fisher.copy_(ls["fisher"].to(device))
             m.anchor_delta.copy_(ls["anchor_delta"].to(device))
 
@@ -166,7 +170,7 @@ class TopologicalMemory:
         result = {}
         for name, layer in self._liquid_layers().items():
             base_norm   = layer.weight.data.norm().item()
-            delta_norm  = layer.delta_w.norm().item()
+            delta_norm  = layer.plastic_norm()
             fisher_norm = layer.fisher.norm().item()
             result[name] = {
                 "delta_norm":       round(delta_norm, 6),
@@ -179,7 +183,7 @@ class TopologicalMemory:
     def total_plastic_norm(self) -> float:
         """Return the sum of L2 norms of ``delta_w`` across all liquid layers."""
         return sum(
-            layer.delta_w.norm().item()
+            layer.plastic_norm()
             for layer in self._liquid_layers().values()
         )
 

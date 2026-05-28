@@ -240,7 +240,7 @@ class CLNChat:
     def _total_plastic_norm(self) -> float:
         """Return the sum of L2 norms of ``delta_w`` across all LiquidLinear layers."""
         return sum(
-            m.delta_w.float().norm().item()
+            m.plastic_norm()
             for m in self.model.modules()
             if isinstance(m, LiquidLinear)
         )
@@ -421,7 +421,7 @@ class CLNChat:
             print("  " + "─" * 76)
             for name, m in layers[:12]:
                 label = name[-46:].ljust(48)
-                dn = m.delta_w.float().norm().item()
+                dn = m.plastic_norm()
                 fn = m.fisher.float().norm().item()
                 bn = m.weight.data.float().norm().item()
                 print(f"  {label}  {dn:>9.5f}  {fn:>9.5f}  {dn/(bn+1e-8):>6.3%}")

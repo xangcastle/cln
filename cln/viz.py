@@ -153,13 +153,13 @@ class ConversationTracker:
         heatmap_candidates = list(self._layer_names)[:4]
 
         for name, m in layers.items():
-            dn = m.delta_w.norm().item()
+            dn = m.plastic_norm()
             bn = m.weight.data.norm().item()
             snap["norms"][name]        = dn
             snap["fisher_norms"][name] = m.fisher.norm().item()
             snap["ratios"][name]       = dn / (bn + 1e-8)
             if name in heatmap_candidates:
-                snap["heatmaps"][name] = self._downsample(m.delta_w)
+                snap["heatmaps"][name] = self._downsample(m.plastic_delta)
 
         self.records.append(snap)
         self.labels.append(label)
