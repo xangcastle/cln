@@ -220,12 +220,15 @@ class LiquidLinear(nn.Module):
                 dA_hebbian = torch.matmul(post_c_flat.t(), torch.matmul(pre_c_flat, B_mat.t())) / (B * S)
                 dB_hebbian = torch.matmul(torch.matmul(post_c_flat, A).t(), pre_c_flat) / (B * S)
                 
-                # Decay terms: A @ (B @ B.T) / tau
-                B_Bt = torch.matmul(B_mat, B_mat.t())
-                At_A = torch.matmul(A.t(), A)
+                # Normalize Hebbian gradient to match dense mode scaling
+                joint_norm = math.sqrt(dA_hebbian.norm().item()**2 + dB_hebbian.norm().item()**2)
+                if joint_norm > 1e-6:
+                    dA_hebbian = dA_hebbian / joint_norm
+                    dB_hebbian = dB_hebbian / joint_norm
                 
-                dA_decay = torch.matmul(A, B_Bt) / tau
-                dB_decay = torch.matmul(At_A, B_mat) / tau
+                # Decay terms: Linear decay to avoid cubic Euler instability
+                dA_decay = A / (2 * tau)
+                dB_decay = B_mat / (2 * tau)
                 
                 dA_ewc = 0
                 dB_ewc = 0
