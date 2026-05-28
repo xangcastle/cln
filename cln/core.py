@@ -238,8 +238,8 @@ class LiquidLinear(nn.Module):
                     dA_ewc = self.lambda_ewc * self.fisher_A.float() * (self.lora_A.float() - self.anchor_A.float())
                     dB_ewc = self.lambda_ewc * self.fisher_B.float() * (self.lora_B.float() - self.anchor_B.float())
                 
-                dA = eff_dt * (eta * gate * dA_hebbian - dA_decay - dA_ewc)
-                dB = eff_dt * (eta * gate * dB_hebbian - dB_decay - dB_ewc)
+                dA = self.dt * (eta * gate * dA_hebbian - dA_decay - dA_ewc)
+                dB = self.dt * (eta * gate * dB_hebbian - dB_decay - dB_ewc)
                 
                 if self.accumulate_steps > 1:
                     self._acc_dA.add_(dA)
@@ -306,11 +306,11 @@ class LiquidLinear(nn.Module):
         if self.lora_rank > 0:
             self.fisher_A.zero_()
             self.fisher_B.zero_()
-            self.anchor_A.zero_()
-            self.anchor_B.zero_()
             self.lora_A.zero_()
             nn.init.kaiming_uniform_(self.lora_A)
             self.lora_B.zero_()
+            self.anchor_A.copy_(self.lora_A)
+            self.anchor_B.zero_()
         else:
             self.fisher.zero_()
             self.anchor_delta.zero_()
