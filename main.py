@@ -14,31 +14,31 @@ GPT2_VARIANTS = {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Chat interactivo con CLN",
+        description="Interactive chat with CLN",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     p.add_argument("--model", "-m", default="microsoft/Phi-3-mini-4k-instruct",
-                   help="ID del modelo HuggingFace o variante GPT-2 (default: Phi-3-mini)")
+                   help="HuggingFace model ID or GPT-2 variant (default: Phi-3-mini)")
     p.add_argument("--memory", "-M", default="cln_memory.pt",
-                   help="Ruta para estado plástico (default: cln_memory.pt)")
+                   help="Path for persistent plastic state (default: cln_memory.pt)")
     p.add_argument("--no-plastic", action="store_true",
-                   help="Desactiva aprendizaje online")
+                   help="Disable online learning")
     p.add_argument("--temp", "-t", type=float, default=0.7,
-                   help="Temperatura de muestreo (default: 0.7)")
+                   help="Sampling temperature (default: 0.7)")
     p.add_argument("--tokens", "-T", type=int, default=300,
-                   help="Máximo de tokens por respuesta (default: 300)")
+                   help="Maximum tokens per response (default: 300)")
     p.add_argument("--top-k", type=int, default=50)
     p.add_argument("--top-p", type=float, default=0.92)
     p.add_argument("--dtype", default="float16",
                    choices=["float16", "float32", "bfloat16"],
-                   help="Dtype para cargar el modelo HF (default: float16)")
+                   help="Weight dtype for the HF model (default: float16)")
     p.add_argument("--device", default=None,
-                   help="Dispositivo: cpu | mps | cuda (default: auto-detect)")
+                   help="Target device: cpu | mps | cuda (default: auto-detect)")
     p.add_argument("--web", action="store_true",
-                   help="Lanza interfaz web en el navegador (requiere flask)")
+                   help="Launch web interface in the browser (requires flask)")
     p.add_argument("--port", "-p", type=int, default=5001,
-                   help="Puerto para la interfaz web (default: 5001)")
+                   help="Port for the web interface (default: 5001)")
     return p.parse_args()
 
 
