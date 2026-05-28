@@ -16,13 +16,11 @@ at each forward pass. No gradient-based training loop is needed — learning
 emerges from the ODE evolution itself.
 """
 
-import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 @dataclass

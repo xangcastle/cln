@@ -79,12 +79,9 @@ def _tokenize(
 ) -> torch.Tensor:
     """Tokenize text and return a 1-D token id tensor on ``device``.
 
-    Uses the HuggingFace tokenizer when provided; otherwise falls back to the
-    tiktoken GPT-2 encoding for CLNModel.
-
     Args:
         text: Plain text to tokenize.
-        tokenizer: HuggingFace tokenizer, or ``None`` for the tiktoken path.
+        tokenizer: HuggingFace tokenizer.
         model: Unused directly; present for interface symmetry.
         device: Target device for the output tensor.
 
@@ -92,18 +89,12 @@ def _tokenize(
         1-D ``torch.long`` tensor of token ids on ``device``.
 
     Raises:
-        ImportError: If ``tokenizer`` is ``None`` and ``tiktoken`` is not installed.
+        ValueError: If ``tokenizer`` is ``None``.
     """
-    if tokenizer is not None:
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        return torch.tensor(ids, dtype=torch.long, device=device)
-
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("gpt2")
-    except ImportError:
-        raise ImportError("pip install tiktoken")
-    return torch.tensor(enc.encode(text), dtype=torch.long, device=device)
+    if tokenizer is None:
+        raise ValueError("A tokenizer is required.")
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    return torch.tensor(ids, dtype=torch.long, device=device)
 
 
 def _plastic_norm(layers: List[LiquidLinear]) -> float:
@@ -134,8 +125,7 @@ def learn_document(
         model: CLNModel or a HuggingFace causal LM with plasticity injected
             via ``inject_plasticity()``.
         text: Full text of the document to learn.
-        tokenizer: HuggingFace tokenizer. Pass ``None`` when using a CLNModel
-            with the tiktoken GPT-2 encoding.
+        tokenizer: HuggingFace tokenizer.
         epochs: Number of full passes over the document. 3–5 epochs is
             typically sufficient for medium-length texts.
         chunk_size: Number of tokens per context window.
@@ -281,22 +271,15 @@ def _consolidate(model: torch.nn.Module) -> None:
 
 
 def _save(model: torch.nn.Module, tokenizer, path: str) -> None:
-    """Save plastic state using the correct backend for the model type.
-
-    Dispatches to ``CLNModel.save_plastic_state()`` for CLNModel instances
-    and to ``save_plastic_state_hf()`` for HuggingFace models.
+    """Save the plastic state of a HuggingFace model with injected plasticity.
 
     Args:
-        model: CLNModel or HuggingFace model with injected plasticity.
-        tokenizer: Unused; present to distinguish the HF path from GPT-2.
+        model: HuggingFace model with injected plasticity.
+        tokenizer: Unused; present for interface symmetry.
         path: Destination file path.
     """
     from .loader import save_plastic_state_hf
-    from .model import CLNModel
-    if isinstance(model, CLNModel):
-        model.save_plastic_state(path)
-    else:
-        save_plastic_state_hf(model, path)
+    save_plastic_state_hf(model, path)
 
 
 def learn_file(
@@ -315,7 +298,7 @@ def learn_file(
         model: CLNModel or HuggingFace model with injected plasticity.
         path: Path to the text file to learn from. Accepts plain text,
             Markdown, reStructuredText, source code, or any UTF-8 encoded file.
-        tokenizer: HuggingFace tokenizer, or ``None`` for the tiktoken path.
+        tokenizer: HuggingFace tokenizer.
         encoding: Character encoding used to read the file.
         **kwargs: Additional keyword arguments forwarded to ``learn_document``
             (e.g. ``epochs``, ``eta_multiplier``, ``save_path``).

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CLN Chat</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="sidebar">
+  <div class="sidebar-section">
+    <div class="logo">CLN</div>
+    <div class="logo-sub">Continuous Liquid Network</div>
+    <div class="model-name" id="model-name">loading...</div>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="stat-grid">
+      <div class="stat-box">
+        <div class="stat-label">‖ΔW‖</div>
+        <div class="stat-val" id="s-norm">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Turns</div>
+        <div class="stat-val" id="s-turns">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Layers</div>
+        <div class="stat-val" id="s-layers">—</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">Mode</div>
+        <div class="stat-val" id="s-mode" style="font-size:12px">—</div>
+      </div>
+    </div>
+    <div style="margin-top:10px">
+      <div style="display:flex;justify-content:space-between;font-size:11px;color:#64748b;margin-bottom:4px">
+        <span>Context</span>
+        <span id="ctx-label">— tok</span>
+      </div>
+      <div style="background:#0f172a;border-radius:4px;height:6px;overflow:hidden;border:1px solid #334155">
+        <div id="ctx-bar" style="height:100%;width:0%;background:#38bdf8;border-radius:4px;transition:width 0.3s"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sidebar-section">
+    <div class="slider-row">
+      <div class="slider-label">Temperature <span id="temp-val">0.7</span></div>
+      <input type="range" id="temp-slider" min="0.05" max="2.0" step="0.05" value="0.7">
+    </div>
+    <div class="slider-row">
+      <div class="slider-label">Max tokens <span id="tokens-val">300</span></div>
+      <input type="range" id="tokens-slider" min="50" max="1000" step="50" value="300">
+    </div>
+  </div>
+
+  <div class="sidebar-section">
+    <button class="btn" onclick="runCmd('/stats', this)">📊 Stats per layer</button>
+    <button class="btn" onclick="runCmd('/save', this)">💾 Save memory</button>
+    <button class="btn" onclick="runCmd('/load', this)">📂 Load memory</button>
+    <button class="btn" onclick="runCmd('/consolidate', this)">🧠 Consolidate EWC</button>
+    <button class="btn" onclick="runCmd('/clear', this)">🗑 Clear history</button>
+    <button class="btn btn-danger" onclick="runCmd('/reset', this)">⚡ Reset ΔW</button>
+    <button class="btn btn-toggle" id="plastic-btn" onclick="togglePlastic()">🔵 Plasticity: ON</button>
+    <hr style="border:0; border-bottom:1px solid #334155; margin: 10px 0;">
+    <input type="file" id="file-upload" accept=".txt,.md,.py,.json" style="display: none">
+    <button class="btn" style="background:#0284c7; color:#fff;" onclick="document.getElementById('file-upload').click()">📚 Teach document</button>
+  </div>
+</div>
+
+<div class="main">
+  <div class="header">
+    <h1 id="header-model">CLN Chat</h1>
+    <span class="badge" id="learn-badge">deferred</span>
+  </div>
+  <div class="chat-area" id="chat"></div>
+  <div class="input-wrapper">
+    <div class="hint">Enter to send &nbsp;·&nbsp; Shift+Enter new line</div>
+    <div class="input-row">
+      <textarea id="msg" placeholder="Type your message..." rows="1"></textarea>
+      <button id="send-btn" onclick="sendMessage()">Send ↑</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

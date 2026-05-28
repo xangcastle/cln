@@ -5,10 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cln"
 version = "0.1.0"
-description = "Redes Líquidas de Aprendizaje Continuo - Continuous Liquid Networks (Hybrid)"
-readme = "README.md"
+description = "Continuous Liquid Networks — weights evolve during inference via Hebbian plasticity"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "CLN Research"},
 ]
@@ -16,7 +15,6 @@ keywords = ["deep-learning", "liquid-networks", "continuous-learning", "llm", "n
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -38,4 +36,4 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src"]
+include = ["cln*"]

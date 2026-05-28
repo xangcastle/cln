@@ -1,9 +1,5 @@
 """
-CLNChat — interactive chat interface supporting two backends.
-
-GPT-2 backend
-    Uses a ``CLNModel`` with tiktoken encoding. Online Hebbian updates happen
-    token-by-token during generation. Loaded via ``load_gpt2()``.
+CLNChat — interactive chat interface for HuggingFace models with CLN plasticity.
 
 HuggingFace backend
     Uses any causal HuggingFace model with plasticity injected by
@@ -15,8 +11,6 @@ HuggingFace backend
     2. Deferred learning: one full forward pass over the complete context +
        response block with ``plastic=True`` after generation completes.
        Much more efficient than updating ΔW token-by-token with KV-cache.
-
-The active backend is detected automatically from the tokenizer type.
 """
 
 import sys
@@ -27,13 +21,6 @@ import torch
 import torch.nn.functional as F
 
 from .core import LiquidLinear, set_plastic_mode
-
-
-GPT2_SYSTEM = (
-    "The following is a conversation between a human and a helpful AI assistant. "
-    "The assistant gives accurate and concise answers.\n\n"
-)
-GPT2_STOP = ["\nHuman:", "\nAssistant:"]
 
 HF_SYSTEM = (
     "You are a precise and helpful assistant. "
@@ -94,16 +81,7 @@ def _sample(
 
 
 class CLNChat:
-    """Interactive chat interface for CLN models.
-
-    Supports both a GPT-2/CLNModel backend (tiktoken encoding, online learning)
-    and a generic HuggingFace backend (any causal LM, deferred learning).
-
-    Example — GPT-2 backend::
-
-        from cln import load_gpt2
-        model = load_gpt2("gpt2")
-        CLNChat(model).run()
+    """Interactive chat interface for CLN models with HuggingFace backend.
 
     Example — HuggingFace backend::
 
@@ -112,7 +90,8 @@ class CLNChat:
         CLNChat(model, tokenizer=tokenizer).run()
 
     Attributes:
-        model: The underlying language model (CLNModel or HuggingFace causal LM).
+        model: The underlying HuggingFace causal language model with injected
+            CLN plasticity.
         memory_path: Path used to persist and restore plastic state between
             sessions.
         history: Ordered list of conversation turns, each a dict with
@@ -136,11 +115,9 @@ class CLNChat:
         """Initialize CLNChat.
 
         Args:
-            model: CLNModel instance (GPT-2 backend) or a HuggingFace causal
-                language model with plasticity injected.
-            tokenizer: HuggingFace tokenizer. When provided, the HuggingFace
-                backend is used. When ``None``, the GPT-2/tiktoken backend is
-                used and ``tiktoken`` must be installed.
+            model: A HuggingFace causal language model with plasticity injected
+                via ``inject_plasticity()``.
+            tokenizer: HuggingFace tokenizer associated with ``model``.
             memory_path: File path for saving and loading plastic state. The
                 file is written automatically after each chat turn when
                 ``plastic=True``.
@@ -155,11 +132,11 @@ class CLNChat:
                 the model from repeating recently generated tokens.
             plastic: When True, plastic weights are updated after each turn and
                 the session state is saved to ``memory_path``.
-            deferred_learning: When True (HuggingFace backend only), Hebbian
-                updates run in a single batch forward pass after generation
-                rather than token-by-token. Ignored for the GPT-2 backend.
+            deferred_learning: When True, Hebbian updates run in a single batch
+                forward pass after generation rather than token-by-token.
         """
         self.model = model
+        self.tokenizer = tokenizer
         self.memory_path = memory_path
         self.max_context_tokens = max_context_tokens
         self.max_new_tokens = max_new_tokens
@@ -174,21 +151,8 @@ class CLNChat:
         self._last_ctx: Optional[torch.Tensor] = None
         self._last_response_ids: List[int] = []
 
-        self._is_hf = tokenizer is not None and hasattr(tokenizer, "apply_chat_template")
-
-        if self._is_hf:
-            self.tokenizer = tokenizer
-            self._stop_ids = self._get_hf_stop_ids()
-            self._device = next(model.parameters()).device
-        else:
-            try:
-                import tiktoken
-            except ImportError:
-                raise ImportError("pip install tiktoken")
-            self.enc = tiktoken.get_encoding("gpt2")
-            self._eot = self.enc.eot_token
-            self._system_tok = self.enc.encode(GPT2_SYSTEM)
-            self._device = torch.device("cpu")
+        self._stop_ids = self._get_hf_stop_ids()
+        self._device = next(model.parameters()).device
 
         self._load_memory()
 
@@ -261,61 +225,17 @@ class CLNChat:
         self._last_context_tokens = ids.shape[1]
         return ids.to(self._device)
 
-    def _build_context_gpt2(self, user_input: str) -> torch.Tensor:
-        """Build a tokenized prompt tensor for the GPT-2/CLNModel backend.
-
-        Formats the system prompt, conversation history, and new user turn as
-        plain text, then encodes with tiktoken. If the resulting token count
-        exceeds ``max_context_tokens``, the oldest non-system tokens are
-        dropped to fit.
-
-        Args:
-            user_input: The user's current message.
-
-        Returns:
-            Integer token tensor of shape [1, T] on CPU.
-        """
-        pieces = [GPT2_SYSTEM]
-        for turn in self.history:
-            tag = "Human: " if turn["role"] == "user" else "Assistant: "
-            pieces.append(tag + turn["content"] + "\n")
-        pieces.append("Human: " + user_input + "\n")
-        pieces.append("Assistant: ")
-
-        tokens = self.enc.encode("".join(pieces))
-        if len(tokens) > self.max_context_tokens:
-            keep = self.max_context_tokens - len(self._system_tok)
-            tokens = self._system_tok + tokens[-keep:]
-        return torch.tensor([tokens])
-
-    def _decode_token_gpt2(self, token_id: int) -> str:
-        """Decode a single token id to a string using the tiktoken GPT-2 encoding.
-
-        Args:
-            token_id: Integer token id.
-
-        Returns:
-            Decoded string fragment.
-        """
-        return self.enc.decode([token_id])
-
     def _load_memory(self) -> None:
         """Restore plastic state from ``memory_path`` if the file exists."""
         if not Path(self.memory_path).exists():
             return
-        if self._is_hf:
-            from .loader import load_plastic_state_hf
-            load_plastic_state_hf(self.model, self.memory_path)
-        else:
-            self.model.load_plastic_state(self.memory_path)
+        from .loader import load_plastic_state_hf
+        load_plastic_state_hf(self.model, self.memory_path)
 
     def _save_memory(self) -> None:
         """Persist the current plastic state to ``memory_path``."""
-        if self._is_hf:
-            from .loader import save_plastic_state_hf
-            save_plastic_state_hf(self.model, self.memory_path)
-        else:
-            self.model.save_plastic_state(self.memory_path)
+        from .loader import save_plastic_state_hf
+        save_plastic_state_hf(self.model, self.memory_path)
 
     def _total_plastic_norm(self) -> float:
         """Return the sum of L2 norms of ``delta_w`` across all LiquidLinear layers."""
@@ -329,12 +249,9 @@ class CLNChat:
     def _generate(self, user_input: str) -> str:
         """Generate a response token by token, streaming each piece to stdout.
 
-        HuggingFace backend: attempts KV-cache inference (O(N+M)). Falls back
-        to full-sequence recomputation (O(N×M)) if the model or installed
-        version of transformers does not support ``DynamicCache``.
-
-        GPT-2 backend: runs the manual generation loop with online Hebbian
-        updates at each step.
+        Attempts KV-cache inference (O(N+M)). Falls back to full-sequence
+        recomputation (O(N×M)) if the model or installed version of
+        transformers does not support ``DynamicCache``.
 
         Args:
             user_input: The user's current message.
@@ -344,96 +261,57 @@ class CLNChat:
         """
         self.model.eval()
 
-        if self._is_hf:
-            ctx = self._build_context_hf(user_input)
-            self._last_ctx = ctx
-            self._last_response_ids = []
+        ctx = self._build_context_hf(user_input)
+        self._last_ctx = ctx
+        self._last_response_ids = []
 
-            generated: List[int] = []
-            response  = ""
-            prev_decoded = ""
+        generated: List[int] = []
+        response  = ""
+        prev_decoded = ""
 
-            set_plastic_mode(False)
+        set_plastic_mode(False)
 
-            _kvcache = False
-            try:
-                from transformers.cache_utils import DynamicCache
-                out = self.model(ctx, past_key_values=DynamicCache(), use_cache=True)
-                past_key_values = out.past_key_values
-                logits = out.logits[0, -1, :]
-                _kvcache = True
-            except Exception:
-                out = self.model(ctx, use_cache=False)
-                logits = out.logits[0, -1, :]
-                past_key_values = None
+        _kvcache = False
+        try:
+            from transformers.cache_utils import DynamicCache
+            out = self.model(ctx, past_key_values=DynamicCache(), use_cache=True)
+            past_key_values = out.past_key_values
+            logits = out.logits[0, -1, :]
+            _kvcache = True
+        except Exception:
+            out = self.model(ctx, use_cache=False)
+            logits = out.logits[0, -1, :]
+            past_key_values = None
 
-            for step in range(self.max_new_tokens):
-                next_id = _sample(logits, generated, self.temperature,
-                                  self.top_k, self.top_p, self.rep_penalty)
-                if next_id in self._stop_ids:
-                    break
+        for step in range(self.max_new_tokens):
+            next_id = _sample(logits, generated, self.temperature,
+                              self.top_k, self.top_p, self.rep_penalty)
+            if next_id in self._stop_ids:
+                break
 
-                generated.append(next_id)
+            generated.append(next_id)
 
-                current = self.tokenizer.decode(generated, skip_special_tokens=True)
-                piece = current[len(prev_decoded):]
-                prev_decoded = current
-                print(piece, end="", flush=True)
-                response += piece
+            current = self.tokenizer.decode(generated, skip_special_tokens=True)
+            piece = current[len(prev_decoded):]
+            prev_decoded = current
+            print(piece, end="", flush=True)
+            response += piece
 
-                if step < self.max_new_tokens - 1:
-                    if _kvcache:
-                        next_input = torch.tensor([[next_id]], device=self._device)
-                        out = self.model(next_input,
-                                        past_key_values=past_key_values, use_cache=True)
-                        past_key_values = out.past_key_values
-                        logits = out.logits[0, -1, :]
-                    else:
-                        full_ids = torch.cat(
-                            [ctx, torch.tensor([generated], device=self._device)], dim=1
-                        )
-                        out = self.model(full_ids, use_cache=False)
-                        logits = out.logits[0, -1, :]
+            if step < self.max_new_tokens - 1:
+                if _kvcache:
+                    next_input = torch.tensor([[next_id]], device=self._device)
+                    out = self.model(next_input,
+                                    past_key_values=past_key_values, use_cache=True)
+                    past_key_values = out.past_key_values
+                    logits = out.logits[0, -1, :]
+                else:
+                    full_ids = torch.cat(
+                        [ctx, torch.tensor([generated], device=self._device)], dim=1
+                    )
+                    out = self.model(full_ids, use_cache=False)
+                    logits = out.logits[0, -1, :]
 
-            self._last_response_ids = generated
-
-        else:
-            ctx = self._build_context_gpt2(user_input)
-            generated = []
-            response  = ""
-            max_len = getattr(self.model, "max_seq_len",
-                              self.max_context_tokens + self.max_new_tokens)
-
-            set_plastic_mode(self.plastic)
-
-            for _ in range(self.max_new_tokens):
-                input_ids = (
-                    torch.cat([ctx, torch.tensor([generated])], dim=1)
-                    if generated else ctx
-                )
-
-                if input_ids.shape[1] > max_len:
-                    input_ids = input_ids[:, -max_len:]
-
-                logits = self.model(input_ids)[0, -1, :]
-                next_id = _sample(logits, generated, self.temperature,
-                                  self.top_k, self.top_p, self.rep_penalty)
-
-                if next_id == self._eot:
-                    break
-
-                generated.append(next_id)
-                piece = self.enc.decode([next_id])
-                print(piece, end="", flush=True)
-                response += piece
-
-                for seq in GPT2_STOP:
-                    if seq in response:
-                        response = response[:response.index(seq)].rstrip()
-                        generated = []
-                        break
-                if not generated:
-                    break
+        self._last_response_ids = generated
 
         set_plastic_mode(True)
         print()
@@ -443,7 +321,6 @@ class CLNChat:
     def _learn_deferred(self) -> None:
         """Run a batch Hebbian update over the full context + response block.
 
-        Only used by the HuggingFace backend when ``deferred_learning=True``.
         Concatenates the stored prompt context with the generated response ids
         and performs one forward pass with ``plastic=True``. This updates all
         ΔW tensors in a single step, which is significantly more efficient
@@ -468,9 +345,9 @@ class CLNChat:
     def chat(self, user_input: str) -> str:
         """Process one user turn: generate a response and optionally learn from it.
 
-        After generation, runs deferred learning (HF backend only), appends
-        both sides of the turn to ``history``, and saves plastic state to disk
-        when ``plastic=True``.
+        After generation, runs deferred learning, appends both sides of the
+        turn to ``history``, and saves plastic state to disk when
+        ``plastic=True``.
 
         Args:
             user_input: The user's message.
@@ -479,7 +356,7 @@ class CLNChat:
             The assistant's response string.
         """
         response = self._generate(user_input)
-        if self.plastic and self.deferred_learning and self._is_hf:
+        if self.plastic and self.deferred_learning:
             self._learn_deferred()
         self.history.append({"role": "user",      "content": user_input})
         self.history.append({"role": "assistant",  "content": response})
@@ -522,8 +399,6 @@ class CLNChat:
             path = parts[1] if len(parts) > 1 else self.memory_path
             if path == self.memory_path:
                 self._save_memory()
-            elif not self._is_hf:
-                self.model.save_plastic_state(path)
             else:
                 __import__(
                     "cln.loader", fromlist=["save_plastic_state_hf"]
@@ -555,11 +430,8 @@ class CLNChat:
             print()
 
         elif cmd == "/consolidate":
-            if self._is_hf:
-                from .loader import consolidate_hf
-                consolidate_hf(self.model)
-            else:
-                self.model.consolidate_all()
+            from .loader import consolidate_hf
+            consolidate_hf(self.model)
             print("  [CLN] Memory consolidated — current knowledge is now protected.")
 
         elif cmd == "/reset":
@@ -600,7 +472,7 @@ class CLNChat:
             eta_mult  = float(parts[3]) if len(parts) > 3 else 10.0
             try:
                 from .learn import learn_file
-                tok = self.tokenizer if self._is_hf else None
+                tok = self.tokenizer
                 learn_file(
                     self.model, path, tokenizer=tok,
                     epochs=epochs, eta_multiplier=eta_mult,
@@ -633,10 +505,7 @@ class CLNChat:
         to ``_handle_command()``; all other lines are sent to ``chat()``.
         The loop exits cleanly on ``EOFError`` or ``KeyboardInterrupt``.
         """
-        model_name = (
-            getattr(self.model.config, "_name_or_path", "HuggingFace")
-            if self._is_hf else "GPT-2"
-        )
+        model_name = getattr(self.model.config, "_name_or_path", "HuggingFace")
 
         print()
         print("╔══════════════════════════════════════════════════════════╗")

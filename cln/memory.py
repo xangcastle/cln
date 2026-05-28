@@ -13,7 +13,6 @@ neurons changes as ΔW evolves — the network's functional topology is differen
 after every interaction.
 """
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional

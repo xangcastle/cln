@@ -21,7 +21,6 @@ import torch.nn as nn
 
 from .core import LiquidLinear
 
-
 _ABBREV = {
     "q_proj":   "Aq",
     "k_proj":   "Ak",
