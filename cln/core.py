@@ -109,8 +109,6 @@ class LiquidLinear(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self.register_buffer("fisher",        torch.zeros(out_features, in_features))
-        self.register_buffer("anchor_delta",  torch.zeros(out_features, in_features))
         self.register_buffer("plasticity_gate", torch.ones(1))
 
         if lora_rank > 0:
@@ -118,11 +116,16 @@ class LiquidLinear(nn.Module):
             self.register_buffer("lora_B", torch.zeros(lora_rank, in_features))
             nn.init.kaiming_uniform_(self.lora_A)
             
-            # We don't need full delta_w in memory during inference if we use LoRA
-            # but we keep it for backward compatibility with older saving scripts if needed.
-            # To save VRAM, we can just use lora_A @ lora_B on the fly.
+            self.register_buffer("fisher_A", torch.zeros(out_features, lora_rank, dtype=torch.float32, device="cpu"))
+            self.register_buffer("fisher_B", torch.zeros(lora_rank, in_features, dtype=torch.float32, device="cpu"))
+            self.register_buffer("anchor_A", torch.zeros(out_features, lora_rank, dtype=torch.float32, device="cpu"))
+            self.register_buffer("anchor_B", torch.zeros(lora_rank, in_features, dtype=torch.float32, device="cpu"))
         else:
             self.register_buffer("delta_w", torch.zeros(out_features, in_features))
+            self.register_buffer("fisher",        torch.zeros(out_features, in_features, dtype=torch.float32, device="cpu"))
+            self.register_buffer("anchor_delta",  torch.zeros(out_features, in_features, dtype=torch.float32, device="cpu"))
+
+
 
         if accumulate_steps > 1:
             if lora_rank > 0:
@@ -147,6 +150,15 @@ class LiquidLinear(nn.Module):
         return self.delta_w.float()
 
     @property
+    def plastic_fisher(self) -> torch.Tensor:
+        """Effective Fisher matrix as a dense tensor (for visualizations)."""
+        if self.lora_rank > 0:
+            # Approximate the full Fisher information for visualization purposes.
+            # In LoRA, the true Fisher is factored. F ≈ F_A @ F_B is a crude visual proxy.
+            return (self.fisher_A.float() @ self.fisher_B.float())
+        return self.fisher.float()
+
+    @property
     def plastic_device(self) -> torch.device:
         """Device holding the plastic state."""
         if self.lora_rank > 0:
@@ -156,6 +168,12 @@ class LiquidLinear(nn.Module):
     def plastic_norm(self) -> float:
         """L2 norm of the plastic delta (works in both full and LoRA mode)."""
         return self.plastic_delta.norm().item()
+
+    def fisher_norm(self) -> float:
+        """L2 norm of the Fisher matrix (works in both full and LoRA mode)."""
+        if self.lora_rank > 0:
+            return math.sqrt(self.fisher_A.norm().item()**2 + self.fisher_B.norm().item()**2)
+        return self.fisher.norm().item()
 
     def plastic_numel(self) -> int:
         """Number of learnable plastic parameters (lora_A+lora_B or delta_w)."""
@@ -211,15 +229,14 @@ class LiquidLinear(nn.Module):
                 
                 dA_ewc = 0
                 dB_ewc = 0
-                if self.lambda_ewc > 0 and hasattr(self, 'fisher'):
-                    if self.fisher.device == self.lora_A.device:
-                        # EWC for LoRA is computationally heavy because it requires Fisher(O, I)
-                        # We approximate or compute it exactly via broadcasting if memory permits.
-                        # For now, we compute exact EWC penalty on A and B, which requires 
-                        # forming the Delta W locally or running it on CPU.
-                        # To keep it extremely fast and VRAM efficient, we omit EWC from LoRA by default
-                        # unless explicitly computed on CPU offline during `consolidate`.
-                        pass
+                if self.lambda_ewc > 0 and hasattr(self, 'fisher_A'):
+                    if self.fisher_A.device != self.lora_A.device:
+                        self.fisher_A = self.fisher_A.to(self.lora_A.device)
+                        self.fisher_B = self.fisher_B.to(self.lora_A.device)
+                        self.anchor_A = self.anchor_A.to(self.lora_A.device)
+                        self.anchor_B = self.anchor_B.to(self.lora_A.device)
+                    dA_ewc = self.lambda_ewc * self.fisher_A.float() * (self.lora_A.float() - self.anchor_A.float())
+                    dB_ewc = self.lambda_ewc * self.fisher_B.float() * (self.lora_B.float() - self.anchor_B.float())
                 
                 dA = eff_dt * (eta * gate * dA_hebbian - dA_decay - dA_ewc)
                 dB = eff_dt * (eta * gate * dB_hebbian - dB_decay - dB_ewc)
@@ -269,26 +286,34 @@ class LiquidLinear(nn.Module):
     def consolidate(self, importance: Optional[torch.Tensor] = None) -> None:
         with torch.no_grad():
             if self.lora_rank > 0:
-                delta_cpu = (self.lora_A.float().cpu() @ self.lora_B.float().cpu())
+                imp_A = self.lora_A.float().cpu().abs()
+                imp_B = self.lora_B.float().cpu().abs()
+                self.fisher_A = self.fisher_A.cpu().mul_(0.9).add_(0.1 * imp_A)
+                self.fisher_B = self.fisher_B.cpu().mul_(0.9).add_(0.1 * imp_B)
+                self.anchor_A = self.lora_A.float().cpu().clone()
+                self.anchor_B = self.lora_B.float().cpu().clone()
             else:
                 delta_cpu = self.delta_w.float().cpu()
-                
-            imp = (
-                importance.float().cpu()
-                if importance is not None
-                else delta_cpu.abs()
-            )
-            self.fisher = self.fisher.cpu().mul_(0.9).add_(0.1 * imp)
-            self.anchor_delta = delta_cpu.clone()
+                imp = (
+                    importance.float().cpu()
+                    if importance is not None
+                    else delta_cpu.abs()
+                )
+                self.fisher = self.fisher.cpu().mul_(0.9).add_(0.1 * imp)
+                self.anchor_delta = delta_cpu.clone()
 
     def reset_plasticity(self) -> None:
-        self.fisher.zero_()
-        self.anchor_delta.zero_()
         if self.lora_rank > 0:
+            self.fisher_A.zero_()
+            self.fisher_B.zero_()
+            self.anchor_A.zero_()
+            self.anchor_B.zero_()
             self.lora_A.zero_()
             nn.init.kaiming_uniform_(self.lora_A)
             self.lora_B.zero_()
         else:
+            self.fisher.zero_()
+            self.anchor_delta.zero_()
             self.delta_w.zero_()
             
         if self.accumulate_steps > 1:

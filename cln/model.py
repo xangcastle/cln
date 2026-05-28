@@ -376,13 +376,19 @@ class CLNModel(nn.Module):
         state: Dict = {}
         for name, m in self.named_modules():
             if isinstance(m, LiquidLinear):
-                entry: Dict = {"fisher": m.fisher.cpu(), "anchor_delta": m.anchor_delta.cpu()}
+                entry: Dict = {}
                 if m.lora_rank > 0:
                     entry["lora_A"] = m.lora_A.cpu()
                     entry["lora_B"] = m.lora_B.cpu()
                     entry["lora_rank"] = m.lora_rank
+                    entry["fisher_A"] = m.fisher_A.cpu()
+                    entry["fisher_B"] = m.fisher_B.cpu()
+                    entry["anchor_A"] = m.anchor_A.cpu()
+                    entry["anchor_B"] = m.anchor_B.cpu()
                 else:
                     entry["delta_w"] = m.delta_w.cpu()
+                    entry["fisher"] = m.fisher.cpu()
+                    entry["anchor_delta"] = m.anchor_delta.cpu()
                 state[name] = entry
         torch.save(state, path)
 
@@ -411,11 +417,17 @@ class CLNModel(nn.Module):
             if "lora_A" in ls and m.lora_rank > 0:
                 m.lora_A.copy_(ls["lora_A"].to(m.lora_A.device, m.lora_A.dtype))
                 m.lora_B.copy_(ls["lora_B"].to(m.lora_B.device, m.lora_B.dtype))
-            elif "delta_w" in ls:
+                if "fisher_A" in ls:
+                    m.fisher_A.copy_(ls["fisher_A"].float().cpu())
+                    m.fisher_B.copy_(ls["fisher_B"].float().cpu())
+                    m.anchor_A.copy_(ls["anchor_A"].float().cpu())
+                    m.anchor_B.copy_(ls["anchor_B"].float().cpu())
+            elif "delta_w" in ls and m.lora_rank == 0:
                 dev = m.plastic_device
                 m.delta_w.copy_(ls["delta_w"].to(dev))
-            m.fisher.copy_(ls["fisher"])
-            m.anchor_delta.copy_(ls["anchor_delta"])
+                if "fisher" in ls:
+                    m.fisher.copy_(ls["fisher"])
+                    m.anchor_delta.copy_(ls["anchor_delta"])
         return True
 
     def plasticity_stats(self) -> Dict[str, Dict]:
@@ -428,7 +440,7 @@ class CLNModel(nn.Module):
                 out[name] = {
                     "delta_norm":       round(dn, 6),
                     "base_norm":        round(bn, 6),
-                    "fisher_norm":      round(m.fisher.norm().item(), 6),
+                    "fisher_norm":      round(m.fisher_norm(), 6),
                     "plasticity_ratio": round(dn / (bn + 1e-8), 6),
                 }
         return out
