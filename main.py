@@ -60,7 +60,7 @@ def _run_web(chat: CLNChat, model_label: str, port: int) -> None:
 
     def _stats() -> dict:
         layers = [m for m in chat.model.modules() if isinstance(m, LiquidLinear)]
-        total_norm = sum(m.plastic_norm() for m in layers)
+        total_norm = sum(m.delta_w.float().norm().item() for m in layers)
         if chat.plastic:
             mode = "deferred" if getattr(chat, "deferred_learning", True) else "online"
         else:
@@ -88,9 +88,9 @@ def _run_web(chat: CLNChat, model_label: str, port: int) -> None:
             "",
             "Top layers by ‖ΔW‖ / ‖W‖:",
         ]
-        top = sorted(layers, key=lambda x: x[1].plastic_norm(), reverse=True)[:10]
+        top = sorted(layers, key=lambda x: x[1].delta_w.float().norm().item(), reverse=True)[:10]
         for name, m in top:
-            dn = m.plastic_norm()
+            dn = m.delta_w.float().norm().item()
             bn = m.weight.data.float().norm().item()
             short = ("…" + name[-38:]) if len(name) > 40 else name
             lines.append(f"  {short:<40}  {dn:.5f}  ({dn / (bn + 1e-8):.2%})")

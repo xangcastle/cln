@@ -376,14 +376,11 @@ class CLNModel(nn.Module):
         state: Dict = {}
         for name, m in self.named_modules():
             if isinstance(m, LiquidLinear):
-                entry: Dict = {"fisher": m.fisher.cpu(), "anchor_delta": m.anchor_delta.cpu()}
-                if m.lora_rank > 0:
-                    entry["lora_A"] = m.lora_A.cpu()
-                    entry["lora_B"] = m.lora_B.cpu()
-                    entry["lora_rank"] = m.lora_rank
-                else:
-                    entry["delta_w"] = m.delta_w.cpu()
-                state[name] = entry
+                state[name] = {
+                    "delta_w":      m.delta_w.cpu(),
+                    "fisher":       m.fisher.cpu(),
+                    "anchor_delta": m.anchor_delta.cpu(),
+                }
         torch.save(state, path)
 
     def load_plastic_state(self, path: str) -> bool:
@@ -405,25 +402,28 @@ class CLNModel(nn.Module):
         state = torch.load(path, map_location="cpu", weights_only=False)
         mods = {n: m for n, m in self.named_modules() if isinstance(m, LiquidLinear)}
         for name, ls in state.items():
-            if name not in mods:
-                continue
-            m = mods[name]
-            if "lora_A" in ls and m.lora_rank > 0:
-                m.lora_A.copy_(ls["lora_A"].to(m.lora_A.device, m.lora_A.dtype))
-                m.lora_B.copy_(ls["lora_B"].to(m.lora_B.device, m.lora_B.dtype))
-            elif "delta_w" in ls:
-                dev = m.plastic_device
-                m.delta_w.copy_(ls["delta_w"].to(dev))
-            m.fisher.copy_(ls["fisher"])
-            m.anchor_delta.copy_(ls["anchor_delta"])
+            if name in mods:
+                dev = mods[name].delta_w.device
+                mods[name].delta_w.copy_(ls["delta_w"].to(dev))
+                mods[name].fisher.copy_(ls["fisher"].to(dev))
+                mods[name].anchor_delta.copy_(ls["anchor_delta"].to(dev))
         return True
 
     def plasticity_stats(self) -> Dict[str, Dict]:
-        """Return per-layer plasticity statistics for every LiquidLinear layer."""
+        """Return per-layer plasticity statistics for every LiquidLinear layer.
+
+        Returns:
+            A dict keyed by fully-qualified layer name. Each value contains:
+
+            - ``delta_norm``: L2 norm of the plastic delta.
+            - ``base_norm``: L2 norm of the frozen base weights.
+            - ``fisher_norm``: L2 norm of the Fisher information matrix.
+            - ``plasticity_ratio``: ``delta_norm / base_norm``.
+        """
         out = {}
         for name, m in self.named_modules():
             if isinstance(m, LiquidLinear):
-                dn = m.plastic_norm()
+                dn = m.delta_w.norm().item()
                 bn = m.weight.data.norm().item()
                 out[name] = {
                     "delta_norm":       round(dn, 6),
@@ -434,7 +434,17 @@ class CLNModel(nn.Module):
         return out
 
     def param_count(self) -> Dict[str, int]:
-        """Return static, plastic, and total parameter counts."""
+        """Return static, plastic, and total parameter counts.
+
+        Returns:
+            Dict with keys ``static`` (gradient-tracked parameters),
+            ``plastic`` (delta_w elements across all LiquidLinear layers),
+            and ``total`` (their sum).
+        """
         static = sum(p.numel() for p in self.parameters())
-        plastic = sum(m.plastic_numel() for m in self.modules() if isinstance(m, LiquidLinear))
+        plastic = sum(
+            m.delta_w.numel()
+            for m in self.modules()
+            if isinstance(m, LiquidLinear)
+        )
         return {"static": static, "plastic": plastic, "total": static + plastic}

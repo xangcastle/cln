@@ -61,14 +61,14 @@ def _boosted_eta(layers: List[LiquidLinear], multiplier: float):
         layers: List of LiquidLinear layers whose ``eta`` will be scaled.
         multiplier: Factor by which to multiply each layer's ``eta``.
     """
-    originals = [layer.eta.item() for layer in layers]
+    originals = [layer.eta for layer in layers]
     for layer in layers:
-        layer.eta.data.fill_(layer.eta.item() * multiplier)
+        layer.eta = layer.eta * multiplier
     try:
         yield
     finally:
         for layer, orig in zip(layers, originals):
-            layer.eta.data.fill_(orig)
+            layer.eta = orig
 
 
 def _tokenize(
@@ -99,7 +99,7 @@ def _tokenize(
 
 def _plastic_norm(layers: List[LiquidLinear]) -> float:
     """Return the sum of L2 norms of ``delta_w`` across all given layers."""
-    return sum(layer.plastic_norm() for layer in layers)
+    return sum(layer.delta_w.float().norm().item() for layer in layers)
 
 
 def learn_document(
