@@ -84,11 +84,16 @@ class TopologicalMemory:
             "interaction_log": self.interaction_log[-1000:],
         }
         for name, layer in self._liquid_layers().items():
-            state[name] = {
-                "delta_w":      layer.delta_w.cpu(),
+            layer_state = {
                 "fisher":       layer.fisher.cpu(),
                 "anchor_delta": layer.anchor_delta.cpu(),
             }
+            if getattr(layer, "lora_rank", 0) > 0:
+                layer_state["lora_A"] = layer.lora_A.cpu()
+                layer_state["lora_B"] = layer.lora_B.cpu()
+            else:
+                layer_state["delta_w"] = layer.delta_w.cpu()
+            state[name] = layer_state
         torch.save(state, path)
 
     def load(self, path: str) -> bool:
@@ -116,8 +121,18 @@ class TopologicalMemory:
             if name not in layers or not isinstance(ls, dict):
                 continue
             m = layers[name]
-            device = m.delta_w.device
-            m.delta_w.copy_(ls["delta_w"].to(device))
+            if getattr(m, "lora_rank", 0) > 0:
+                device = m.lora_A.device
+                if "lora_A" in ls and "lora_B" in ls:
+                    m.lora_A.copy_(ls["lora_A"].to(device))
+                    m.lora_B.copy_(ls["lora_B"].to(device))
+                elif "delta_w" in ls:
+                    pass # Cannot trivially load full delta into LoRA A/B matrices
+            else:
+                device = m.delta_w.device
+                if "delta_w" in ls:
+                    m.delta_w.copy_(ls["delta_w"].to(device))
+                
             m.fisher.copy_(ls["fisher"].to(device))
             m.anchor_delta.copy_(ls["anchor_delta"].to(device))
 
@@ -166,7 +181,7 @@ class TopologicalMemory:
         result = {}
         for name, layer in self._liquid_layers().items():
             base_norm   = layer.weight.data.norm().item()
-            delta_norm  = layer.delta_w.norm().item()
+            delta_norm  = layer.plastic_delta.norm().item()
             fisher_norm = layer.fisher.norm().item()
             result[name] = {
                 "delta_norm":       round(delta_norm, 6),
@@ -179,7 +194,7 @@ class TopologicalMemory:
     def total_plastic_norm(self) -> float:
         """Return the sum of L2 norms of ``delta_w`` across all liquid layers."""
         return sum(
-            layer.delta_w.norm().item()
+            layer.plastic_delta.norm().item()
             for layer in self._liquid_layers().values()
         )
 

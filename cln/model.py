@@ -442,9 +442,11 @@ class CLNModel(nn.Module):
             and ``total`` (their sum).
         """
         static = sum(p.numel() for p in self.parameters())
-        plastic = sum(
-            m.delta_w.numel()
-            for m in self.modules()
-            if isinstance(m, LiquidLinear)
-        )
+        plastic = 0
+        for m in self.modules():
+            if isinstance(m, LiquidLinear):
+                if getattr(m, "lora_rank", 0) > 0:
+                    plastic += m.lora_A.numel() + m.lora_B.numel()
+                else:
+                    plastic += m.delta_w.numel()
         return {"static": static, "plastic": plastic, "total": static + plastic}

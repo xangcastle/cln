@@ -99,7 +99,7 @@ def _tokenize(
 
 def _plastic_norm(layers: List[LiquidLinear]) -> float:
     """Return the sum of L2 norms of ``delta_w`` across all given layers."""
-    return sum(layer.delta_w.float().norm().item() for layer in layers)
+    return sum(layer.plastic_delta.norm().item() for layer in layers)
 
 
 def learn_document(

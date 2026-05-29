@@ -101,13 +101,25 @@ def inject_plasticity(
                 if child.bias is not None:
                     liquid.bias.data = child.bias.data.clone()
 
-                liquid.register_buffer(
-                    "delta_w",
-                    torch.zeros(
-                        child.out_features, child.in_features,
-                        dtype=src_dtype, device=weight_dev,
-                    ),
-                )
+                lora_rank = lkw.get("lora_rank", 0)
+                if lora_rank > 0:
+                    liquid.register_buffer(
+                        "lora_A", torch.zeros(child.out_features, lora_rank, dtype=src_dtype, device=weight_dev)
+                    )
+                    liquid.register_buffer(
+                        "lora_B", torch.zeros(lora_rank, child.in_features, dtype=src_dtype, device=weight_dev)
+                    )
+                    nn.init.kaiming_uniform_(liquid.lora_A)
+                    if lkw.get("accumulate_steps", 1) > 1:
+                        liquid.register_buffer("_acc_dA", torch.zeros(child.out_features, lora_rank, dtype=src_dtype, device=weight_dev))
+                        liquid.register_buffer("_acc_dB", torch.zeros(lora_rank, child.in_features, dtype=src_dtype, device=weight_dev))
+                else:
+                    liquid.register_buffer(
+                        "delta_w", torch.zeros(child.out_features, child.in_features, dtype=src_dtype, device=weight_dev)
+                    )
+                    if lkw.get("accumulate_steps", 1) > 1:
+                        liquid.register_buffer("_hebbian_acc", torch.zeros(child.out_features, child.in_features, dtype=src_dtype, device=weight_dev))
+                
                 liquid.register_buffer(
                     "fisher",
                     torch.zeros(
@@ -152,11 +164,16 @@ def save_plastic_state_hf(model: nn.Module, path: str) -> None:
     state: dict = {"__model_id__": getattr(model, "_cln_model_id", None)}
     for name, m in model.named_modules():
         if isinstance(m, LiquidLinear):
-            state[name] = {
-                "delta_w":      m.delta_w.cpu(),
+            layer_state = {
                 "fisher":       m.fisher.cpu(),
                 "anchor_delta": m.anchor_delta.cpu(),
             }
+            if getattr(m, "lora_rank", 0) > 0:
+                layer_state["lora_A"] = m.lora_A.cpu()
+                layer_state["lora_B"] = m.lora_B.cpu()
+            else:
+                layer_state["delta_w"] = m.delta_w.cpu()
+            state[name] = layer_state
     torch.save(state, path)
 
 
@@ -205,11 +222,26 @@ def load_plastic_state_hf(model: nn.Module, path: str) -> bool:
         if name.startswith("__") or name not in mods:
             continue
         m = mods[name]
-        dw_saved = ls["delta_w"]
-        if dw_saved.shape != m.delta_w.shape:
-            skipped += 1
-            continue
-        m.delta_w.copy_(dw_saved.to(m.delta_w.device, m.delta_w.dtype))
+        
+        if getattr(m, "lora_rank", 0) > 0:
+            if "lora_A" in ls and "lora_B" in ls:
+                if ls["lora_A"].shape != m.lora_A.shape:
+                    skipped += 1
+                    continue
+                m.lora_A.copy_(ls["lora_A"].to(m.lora_A.device, m.lora_A.dtype))
+                m.lora_B.copy_(ls["lora_B"].to(m.lora_B.device, m.lora_B.dtype))
+            elif "delta_w" in ls:
+                pass # Can't trivially load full delta into LoRA matrices
+        else:
+            if "delta_w" not in ls:
+                skipped += 1
+                continue
+            dw_saved = ls["delta_w"]
+            if dw_saved.shape != m.delta_w.shape:
+                skipped += 1
+                continue
+            m.delta_w.copy_(dw_saved.to(m.delta_w.device, m.delta_w.dtype))
+            
         m.fisher.copy_(ls["fisher"].float().cpu())
         m.anchor_delta.copy_(ls["anchor_delta"].float().cpu())
 
@@ -328,11 +360,13 @@ def load_hf(
 
     if verbose:
         total_params   = sum(p.numel() for p in model.parameters())
-        plastic_params = sum(
-            m.delta_w.numel()
-            for m in model.modules()
-            if isinstance(m, LiquidLinear)
-        )
+        plastic_params = 0
+        for m in model.modules():
+            if isinstance(m, LiquidLinear):
+                if getattr(m, "lora_rank", 0) > 0:
+                    plastic_params += m.lora_A.numel() + m.lora_B.numel()
+                else:
+                    plastic_params += m.delta_w.numel()
         scope = (
             "MLP-only" if target_names is MLP_MODULES
             else ("all" if target_names is None else "custom")

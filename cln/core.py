@@ -102,6 +102,8 @@ class LiquidLinear(nn.Module):
         dt: float = 0.1,
         max_delta: float = 0.3,
         solver_mode: str = "ml_fast",
+        accumulate_steps: int = 1,
+        lora_rank: int = 0,
     ):
         """Initialize a LiquidLinear layer.
 
@@ -131,6 +133,8 @@ class LiquidLinear(nn.Module):
         self.dt = dt
         self.max_delta = max_delta
         self.solver_mode = solver_mode
+        self.accumulate_steps = accumulate_steps
+        self.lora_rank = lora_rank
 
         if self.solver_mode == "bio_ode":
             from .bio_core import LiquidNeuronBank
@@ -153,16 +157,40 @@ class LiquidLinear(nn.Module):
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter("bias", None)
-
-        self.register_buffer("delta_w",       torch.zeros(out_features, in_features))
-        self.register_buffer("fisher",        torch.zeros(out_features, in_features))
-        self.register_buffer("anchor_delta",  torch.zeros(out_features, in_features))
-        self.register_buffer("plasticity_gate", torch.ones(1))
+        if lora_rank > 0:
+            self.register_buffer("lora_A", torch.zeros(out_features, lora_rank))
+            self.register_buffer("lora_B", torch.zeros(lora_rank, in_features))
+            nn.init.kaiming_uniform_(self.lora_A)
+            # Fisher and anchor are still full dense for now (Step 3)
+            self.register_buffer("fisher",        torch.zeros(out_features, in_features, dtype=torch.float32, device="cpu"))
+            self.register_buffer("anchor_delta",  torch.zeros(out_features, in_features, dtype=torch.float32, device="cpu"))
+            self.register_buffer("plasticity_gate", torch.ones(1))
+            if accumulate_steps > 1:
+                self.register_buffer("_acc_dA", torch.zeros(out_features, lora_rank))
+                self.register_buffer("_acc_dB", torch.zeros(lora_rank, in_features))
+                self._acc_count: int = 0
+        else:
+            self.register_buffer("delta_w",       torch.zeros(out_features, in_features))
+            self.register_buffer("fisher",        torch.zeros(out_features, in_features, dtype=torch.float32, device="cpu"))
+            self.register_buffer("anchor_delta",  torch.zeros(out_features, in_features, dtype=torch.float32, device="cpu"))
+            self.register_buffer("plasticity_gate", torch.ones(1))
+    
+            if accumulate_steps > 1:
+                self.register_buffer("_hebbian_acc", torch.zeros(out_features, in_features))
+                self._acc_count: int = 0
 
     @property
     def effective_weight(self) -> torch.Tensor:
         """Return the sum of base weights and the current plastic delta."""
+        if self.lora_rank > 0:
+            return self.weight + (self.lora_A.float() @ self.lora_B.float()).to(self.weight.dtype)
         return self.weight + self.delta_w
+
+    @property
+    def plastic_delta(self) -> torch.Tensor:
+        if self.lora_rank > 0:
+            return self.lora_A.float() @ self.lora_B.float()
+        return self.delta_w.float()
 
     def liquid_step(self, pre: torch.Tensor, post: torch.Tensor) -> None:
         """Apply one Euler step of the plastic weight ODE.
@@ -188,28 +216,86 @@ class LiquidLinear(nn.Module):
             pre_c  = pre_f  - pre_f.mean(dim=1, keepdim=True)
             post_c = post_f - post_f.mean(dim=1, keepdim=True)
 
-            hebbian = torch.einsum('bso,bsi->oi', post_c, pre_c) / (B * S)
-            h_norm = hebbian.norm()
-            if h_norm > 1e-6:
-                hebbian = hebbian / h_norm
+            eff_dt = self.dt * self.accumulate_steps
+            
+            if self.lora_rank > 0:
+                A = self.lora_A.float()
+                B_mat = self.lora_B.float()
+                
+                pre_c_flat = pre_c.view(-1, self.in_features)
+                post_c_flat = post_c.view(-1, self.out_features)
+                
+                dA_hebbian = torch.matmul(post_c_flat.t(), torch.matmul(pre_c_flat, B_mat.t())) / (B * S)
+                dB_hebbian = torch.matmul(torch.matmul(post_c_flat, A).t(), pre_c_flat) / (B * S)
+                
+                joint_norm = math.sqrt(dA_hebbian.norm().item()**2 + dB_hebbian.norm().item()**2)
+                if joint_norm > 1e-6:
+                    dA_hebbian = dA_hebbian / joint_norm
+                    dB_hebbian = dB_hebbian / joint_norm
+                    
+                dA_decay = A / (2 * self.tau_w)
+                dB_decay = B_mat / (2 * self.tau_w)
+                
+                ewc_dev = self.lora_A.device
+                if self.lambda_ewc > 0 and self.fisher.device == ewc_dev:
+                    ewc = self.fisher.float() * (self.plastic_delta - self.anchor_delta.float())
+                    # Project dense EWC penalty into A and B gradients
+                    dA_ewc = self.lambda_ewc * torch.matmul(ewc, B_mat.t())
+                    dB_ewc = self.lambda_ewc * torch.matmul(A.t(), ewc)
+                else:
+                    dA_ewc = 0
+                    dB_ewc = 0
+                    
+                dA = self.dt * (self.eta * float(self.plasticity_gate) * dA_hebbian - dA_decay - dA_ewc)
+                dB = self.dt * (self.eta * float(self.plasticity_gate) * dB_hebbian - dB_decay - dB_ewc)
+                
+                if self.accumulate_steps > 1:
+                    self._acc_dA.add_(dA)
+                    self._acc_dB.add_(dB)
+                    self._acc_count += 1
+                    if self._acc_count < self.accumulate_steps:
+                        return
+                    self.lora_A.add_(self._acc_dA.to(self.lora_A.dtype)).clamp_(-self.max_delta, self.max_delta)
+                    self.lora_B.add_(self._acc_dB.to(self.lora_B.dtype)).clamp_(-self.max_delta, self.max_delta)
+                    self._acc_dA.zero_()
+                    self._acc_dB.zero_()
+                    self._acc_count = 0
+                else:
+                    self.lora_A.add_(dA.to(self.lora_A.dtype)).clamp_(-self.max_delta, self.max_delta)
+                    self.lora_B.add_(dB.to(self.lora_B.dtype)).clamp_(-self.max_delta, self.max_delta)
 
-            ewc_dev = self.delta_w.device
-            if self.lambda_ewc > 0 and self.fisher.device == ewc_dev:
-                ewc = self.fisher.float() * (
-                    self.delta_w.float() - self.anchor_delta.float()
-                )
             else:
-                ewc = torch.zeros_like(hebbian)
-
-            dw = self.delta_w.float()
-            d_delta = (
-                -dw / self.tau_w
-                + self.eta * float(self.plasticity_gate) * hebbian
-                - self.lambda_ewc * ewc
-            )
-
-            self.delta_w.add_((self.dt * d_delta).to(self.delta_w.dtype))
-            self.delta_w.clamp_(-self.max_delta, self.max_delta)
+                hebbian = torch.einsum('bso,bsi->oi', post_c, pre_c) / (B * S)
+                h_norm = hebbian.norm()
+                if h_norm > 1e-6:
+                    hebbian = hebbian / h_norm
+    
+                if self.accumulate_steps > 1:
+                    self._hebbian_acc.add_(hebbian)
+                    self._acc_count += 1
+                    if self._acc_count < self.accumulate_steps:
+                        return
+                    hebbian = self._hebbian_acc / self._acc_count
+                    self._hebbian_acc.zero_()
+                    self._acc_count = 0
+    
+                ewc_dev = self.delta_w.device
+                if self.lambda_ewc > 0 and self.fisher.device == ewc_dev:
+                    ewc = self.fisher.float() * (
+                        self.delta_w.float() - self.anchor_delta.float()
+                    )
+                else:
+                    ewc = torch.zeros_like(hebbian)
+    
+                dw = self.delta_w.float()
+                d_delta = (
+                    -dw / self.tau_w
+                    + self.eta * float(self.plasticity_gate) * hebbian
+                    - self.lambda_ewc * ewc
+                )
+    
+                self.delta_w.add_((eff_dt * d_delta).to(self.delta_w.dtype))
+                self.delta_w.clamp_(-self.max_delta, self.max_delta)
 
     def consolidate(self, importance: Optional[torch.Tensor] = None) -> None:
         """Merge the current plastic state into the EWC anchor.
@@ -225,7 +311,7 @@ class LiquidLinear(nn.Module):
                 ``delta_w`` is used as a proxy for importance.
         """
         with torch.no_grad():
-            delta_cpu = self.delta_w.float().cpu()
+            delta_cpu = self.plastic_delta.cpu()
             imp = (
                 importance.float().cpu()
                 if importance is not None
@@ -236,9 +322,23 @@ class LiquidLinear(nn.Module):
 
     def reset_plasticity(self) -> None:
         """Zero out all plastic state, effectively wiping the layer's memory."""
-        self.delta_w.zero_()
+        if self.lora_rank > 0:
+            self.lora_A.zero_()
+            nn.init.kaiming_uniform_(self.lora_A)
+            self.lora_B.zero_()
+        else:
+            self.delta_w.zero_()
+            
         self.fisher.zero_()
         self.anchor_delta.zero_()
+        
+        if getattr(self, "accumulate_steps", 1) > 1:
+            if self.lora_rank > 0:
+                self._acc_dA.zero_()
+                self._acc_dB.zero_()
+            else:
+                self._hebbian_acc.zero_()
+            self._acc_count = 0
 
     def forward(self, x: torch.Tensor, plastic: Optional[bool] = None) -> torch.Tensor:
         """Compute the linear transformation and optionally update plastic weights.
