@@ -37,8 +37,11 @@ def parse_args():
                    help="Launch web interface in the browser (requires flask)")
     p.add_argument("--port", "-p", type=int, default=5001,
                    help="Port for the web interface (default: 5001)")
+    p.add_argument("--lora-rank", type=int, default=16,
+                   help="LoRA rank for plasticity (default: 16)")
+    p.add_argument("--accumulate-steps", type=int, default=1,
+                   help="Number of steps to accumulate before applying plasticity (default: 1)")
     return p.parse_args()
-
 
 def _run_web(chat: CLNChat, model_label: str, port: int) -> None:
     try:
@@ -60,7 +63,7 @@ def _run_web(chat: CLNChat, model_label: str, port: int) -> None:
 
     def _stats() -> dict:
         layers = [m for m in chat.model.modules() if isinstance(m, LiquidLinear)]
-        total_norm = sum(m.delta_w.float().norm().item() for m in layers)
+        total_norm = sum(m.plastic_delta.norm().item() for m in layers)
         if chat.plastic:
             mode = "deferred" if getattr(chat, "deferred_learning", True) else "online"
         else:
@@ -88,9 +91,9 @@ def _run_web(chat: CLNChat, model_label: str, port: int) -> None:
             "",
             "Top layers by ‖ΔW‖ / ‖W‖:",
         ]
-        top = sorted(layers, key=lambda x: x[1].delta_w.float().norm().item(), reverse=True)[:10]
+        top = sorted(layers, key=lambda x: x[1].plastic_delta.norm().item(), reverse=True)[:10]
         for name, m in top:
-            dn = m.delta_w.float().norm().item()
+            dn = m.plastic_delta.norm().item()
             bn = m.weight.data.float().norm().item()
             short = ("…" + name[-38:]) if len(name) > 40 else name
             lines.append(f"  {short:<40}  {dn:.5f}  ({dn / (bn + 1e-8):.2%})")
@@ -272,9 +275,14 @@ def main():
     dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16}
     dtype = dtype_map[args.dtype]
 
+    liquid_kwargs = {
+        "lora_rank": args.lora_rank,
+        "accumulate_steps": args.accumulate_steps,
+    }
+
     from cln.loader import load_hf
     model, tokenizer = load_hf(
-        args.model, dtype=dtype, device=args.device, verbose=True,
+        args.model, dtype=dtype, device=args.device, verbose=True, liquid_kwargs=liquid_kwargs,
     )
 
     chat = CLNChat(

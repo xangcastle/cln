@@ -2,3 +2,7 @@
 .idea
 venv
 *.pt
+.env
+__pycache__/
+**/*.pyc
+*.png
